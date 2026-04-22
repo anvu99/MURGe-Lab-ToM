@@ -5,7 +5,7 @@ import re
 #   [Round 2] You (Agent_Llama):
 #   [Round 1] Peer (Agent_Qwen):
 _HALLUCINATED_TURN_RE = re.compile(
-    r"^\s*\[Round\s+\d+\]\s+(?:You|Peer)\s*\([^)]+\)\s*:",
+    r"^\s*\[Round\s+\d+\]\s+(?:You|Peer)(?:\s*\([^)]+\))?\s*:",
     re.MULTILINE,
 )
 

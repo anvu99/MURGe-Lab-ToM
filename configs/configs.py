@@ -3,7 +3,7 @@ Shared dataclasses for the multi-agent debate system.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -20,6 +20,10 @@ class RoundEntry:
     """One round of the debate, containing every agent's response."""
     agent_responses: Dict[str, AgentResponse] = field(default_factory=dict)
     # key = agent_id (e.g., "agent_0"), value = that agent's response
+
+    # Populated by AsyncDebateArena only: ordered list of agent_ids in the
+    # exact sequence they spoke within this round. None in synchronous mode.
+    turn_order: Optional[List[str]] = field(default=None)
 
 
 # A full conversation is simply: List[RoundEntry]

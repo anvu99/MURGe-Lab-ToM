@@ -227,22 +227,41 @@ class ToMMemory(BaseMemory):
         agent_names = list({resp.name for round_entry in conversation for resp in round_entry.agent_responses.values()})
         evidence_built: Dict[str, str] = {}
         
+        # Detect if this is an async debate (any round has turn_order populated)
+        is_async = any(getattr(re, "turn_order", None) for re in conversation)
+
+        async_preamble = ""
+        if is_async:
+            async_preamble = (
+                "[DEBATE FORMAT: ASYNCHRONOUS]\n"
+                "Agents spoke sequentially within each round — not simultaneously.\n"
+                "Within a given round, each agent had full visibility of all preceding "
+                "agents' public messages before forming their own response.\n"
+                "The first speaker in each round reasoned independently with no peer "
+                "context for that round. Later speakers already had access to earlier "
+                "speakers' current-round messages, so same-round agreement does NOT "
+                "indicate cross-round persuasion.\n"
+            )
+
         for target_agent in agent_names:
             evidence_lines = []
+            if is_async:
+                evidence_lines.append(async_preamble)
+
             for round_idx, round_entry in enumerate(conversation):
                 lines = [f"[Round {round_idx}]"]
-                
+
                 owner_response = None
                 public_transcript = []
-                
+
                 for _, response in round_entry.agent_responses.items():
                     if response.name == self.owner_name:
                         owner_response = response
-                    
+
                     pub_msg = response.public_message if response.public_message else "(No public message provided)"
                     if not response.public_message and hasattr(response, 'reasoning') and response.reasoning:
-                        pub_msg = response.reasoning[-200:] # fallback
-                        
+                        pub_msg = response.reasoning[-200:]  # fallback
+
                     pub_line = f"    {response.name}: {pub_msg} (answered {response.answer})"
                     public_transcript.append(pub_line)
 
@@ -251,11 +270,11 @@ class ToMMemory(BaseMemory):
                     if target_agent == self.owner_name:
                         lines.append(f"  Your Public Message: {owner_response.public_message}")
                         lines.append(f"  Your Answer: {owner_response.answer}")
-                        
+
                 lines.append("  Public Debate Transcript:")
                 lines.extend(public_transcript)
                 evidence_lines.append("\n".join(lines))
-                
+
             evidence_built[target_agent] = "\n\n".join(evidence_lines)
 
         # Generate / refine a belief for each observed agent
