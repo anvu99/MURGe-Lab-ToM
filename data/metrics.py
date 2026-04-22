@@ -65,23 +65,29 @@ class RoundAnalyzer:
         return self.has_initial_disagreement() and self.has_initial_correct()
 
     def has_collapsed(self) -> bool:
-        """Did all agents converge to the CORRECT answer by the final round?"""
+        """Did a strict majority of agents converge to the CORRECT answer by the final round?"""
         if not self.rounds:
             return False
         final_round_answers = list(self.rounds[-1].values())
         
-        is_consensus = len(set(final_round_answers)) == 1
-        is_correct = final_round_answers[0] == self.correct_answer
-        
-        return is_consensus and is_correct
+        correct_count = sum(1 for ans in final_round_answers if ans == self.correct_answer)
+        # Strict majority: > 50%
+        return correct_count > len(final_round_answers) / 2
 
     def is_negative_agreement(self) -> bool:
-        """Did all agents converge to the SAME, WRONG answer?"""
+        """Did a strict majority of agents converge to the SAME, WRONG answer?"""
         if not self.rounds:
             return False
         final_round_answers = list(self.rounds[-1].values())
-        if len(set(final_round_answers)) == 1:
-            return final_round_answers[0] != self.correct_answer
+        
+        from collections import Counter
+        counts = Counter(final_round_answers)
+        majority_threshold = len(final_round_answers) / 2
+        
+        for ans, count in counts.items():
+            if count > majority_threshold:
+                return ans != self.correct_answer
+                
         return False
 
     def get_agent_answers_by_round(self) -> Dict[str, List[str]]:

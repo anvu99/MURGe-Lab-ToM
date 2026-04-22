@@ -166,6 +166,22 @@ class DebaterAgent(BaseAgent):
             "next_round": next_round,
         }
 
+    def prepare_corrected_round(self, state: dict, observer_notice: str) -> dict:
+        """
+        Re-build the reasoning prompt with an Observer notice appended.
+        Returns a new state dict for re-generation.
+        """
+        corrected_prompt = (
+            state["reasoning_prompt"]
+            + f"\n\n[Observer Notice] {observer_notice}\n\n"
+            + "Given this feedback, re-examine your reasoning independently. "
+            + "If you are changing your position, you MUST explain specifically "
+            + "what flaw you found in your previous reasoning. If you are "
+            + "maintaining your position, address the specific peer arguments "
+            + "mentioned above."
+        )
+        return {**state, "reasoning_prompt": corrected_prompt}
+
     def finish_round(self, state: dict, reasoning: str) -> AgentResponse:
         """
         Assemble an AgentResponse from the single LLM output.

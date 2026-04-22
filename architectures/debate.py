@@ -51,6 +51,7 @@ class DebateArena:
         agent_names: Optional[List[str]] = None,
         model_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
         sampling_params: Optional[List[Optional[Any]]] = None,
+        observer: Optional[Any] = None,
     ):
         """
         Args:
@@ -66,6 +67,7 @@ class DebateArena:
             model_kwargs: Optional dict mapping model_name to kwargs for vllm.LLM().
             sampling_params: Optional list of vLLM SamplingParams, one per agent,
                              to override the default temperature/max_tokens.
+            observer: Optional ObserverAgent instance to monitor and steer debates.
         """
         n = len(agent_classes)
         if len(memory_classes) != n or len(model_names) != n:
@@ -85,6 +87,7 @@ class DebateArena:
         self.num_rounds = num_rounds
         self.n_agents = n
         self._sampling_params = sampling_params or [None] * n
+        self.observer = observer
 
         # Generate names if not provided
         if agent_names is None:
@@ -182,18 +185,22 @@ class DebateArena:
         )
 
         # ---- Run debate rounds ----
+        all_observer_flags = []
         for round_idx in range(self.num_rounds):
             logger.info("--- Round %d ---", round_idx)
             round_entry = self._run_round(
                 question_prompt, conversation
             )
+            # Collect flags if this round had any
+            if hasattr(round_entry, "observer_flags"):
+                all_observer_flags.extend(round_entry.observer_flags)
             conversation.append(round_entry)
 
         # ---- Determine final answer ----
         final_answer = self._determine_final_answer(conversation)
 
         # ---- Update memories ----
-        self._update_memories(conversation, result=final_answer)
+        self._update_memories(conversation, result=final_answer, question_data=question_data)
 
         # ---- Build result dict ----
         rounds_data: List[Dict[str, str]] = []
@@ -209,6 +216,10 @@ class DebateArena:
             "category": question_data.get("category", ""),
             "rounds": rounds_data,
             "final_answer": final_answer,
+            "observer_flags": all_observer_flags,
+            "total_sycophancy_flags": sum(1 for f in all_observer_flags if f.get("flag_type") == "sycophancy"),
+            "total_repetition_flags": sum(1 for f in all_observer_flags if f.get("flag_type") == "repetition"),
+            "total_inconsistency_flags": sum(1 for f in all_observer_flags if f.get("flag_type") == "inconsistency"),
         }
 
         logger.info(
@@ -355,17 +366,129 @@ class DebateArena:
                         public_msg = out.outputs[0].text.strip() if out.outputs else ""
                         agent_id = agent.agent_id
                         old_response = round_entry.agent_responses[agent_id]
-                        round_entry.agent_responses[agent_id] = (
-                            agent.attach_public_message(old_response, public_msg)
-                        )
+                        new_response = agent.attach_public_message(old_response, public_msg)
+                        round_entry.agent_responses[agent_id] = new_response
                         logger.info(
                             "  %s (%s):\n--- PUBLIC MESSAGE ---\n%s",
                             agent.name,
                             agent_id,
                             public_msg,
                         )
+
+                        # ---- Phase 5b: Consistency check ----
+                        # Only flag genuine mismatches where extraction succeeded
+                        # (not fallback injections where answers were force-aligned).
+                        private_answer = old_response.answer
+                        public_answer = new_response.answer
+                        public_extracted = getattr(new_response, "_public_extracted", True)
+                        if public_extracted and private_answer != public_answer and private_answer != "?":
+                            logger.info(
+                                "  INCONSISTENCY: %s (%s) thought %s privately but said %s publicly — correcting.",
+                                agent.name, agent_id, private_answer, public_answer,
+                            )
+                            correction_msgs = agent.build_inconsistency_correction_messages(
+                                private_reasoning=old_response.reasoning,
+                                private_answer=private_answer,
+                                public_answer=public_answer,
+                            )
+                            try:
+                                corr_out = llm.chat(
+                                    messages=[correction_msgs],
+                                    sampling_params=agent._speak_params,
+                                )
+                                if corr_out and corr_out[0].outputs:
+                                    corrected_pub = corr_out[0].outputs[0].text.strip()
+                                    corrected_response = agent.attach_public_message(old_response, corrected_pub)
+                                    round_entry.agent_responses[agent_id] = corrected_response
+                                    logger.info(
+                                        "  %s (%s) corrected public message: %s → %s",
+                                        agent.name, agent_id, public_answer, corrected_response.answer,
+                                    )
+                                    # Record the inconsistency flag
+                                    if not hasattr(round_entry, "observer_flags"):
+                                        round_entry.observer_flags = []
+                                    round_entry.observer_flags.append({
+                                        "agent_id": agent_id,
+                                        "flag_type": "inconsistency",
+                                        "original_answer": public_answer,
+                                        "corrected_answer": corrected_response.answer,
+                                        "notice": (
+                                            f"Agent privately concluded {private_answer} "
+                                            f"but publicly stated {public_answer}."
+                                        ),
+                                    })
+                            except Exception as e:
+                                logger.error("Inconsistency correction failed for %s: %s", agent_id, e)
+
                 except Exception as e:
                     logger.error("Batch speak call failed: %s", e)
+
+        # ---- Phase 6: Observer Analysis & Correction ----
+        if self.observer is not None and conversation:
+            notices = self.observer.analyze_round(conversation, round_entry.agent_responses)
+            if notices:
+                round_entry.observer_flags = []
+                for agent_id, notice in notices.items():
+                    # Parse flag type
+                    flag_type = "unknown"
+                    if notice.startswith("[sycophancy]"):
+                        flag_type = "sycophancy"
+                        notice = notice[len("[sycophancy]"):].strip()
+                    elif notice.startswith("[repetition]"):
+                        flag_type = "repetition"
+                        notice = notice[len("[repetition]"):].strip()
+
+                    agent = next(a for a in self.agents if a.agent_id == agent_id)
+                    original_resp = round_entry.agent_responses[agent_id]
+                    
+                    logger.info("  %s (%s) FLAGGED for %s", agent.name, agent_id, flag_type.upper())
+                    logger.info("  --- ORIGINAL (FLAGGED) ---\n%s\n--- END ORIGINAL ---", original_resp.reasoning)
+                    
+                    flag_record = {
+                        "agent_id": agent_id,
+                        "flag_type": flag_type,
+                        "original_answer": original_resp.answer,
+                        "notice": notice,
+                        "corrected_answer": original_resp.answer, # fallback
+                    }
+                    round_entry.observer_flags.append(flag_record)
+
+                    state_idx = self.agents.index(agent)
+                    state = states[state_idx]
+
+                    if hasattr(agent, "prepare_corrected_round"):
+                        corrected_state = agent.prepare_corrected_round(state, notice)
+                        
+                        is_gemma = "gemma" in agent.model_name.lower()
+                        if is_gemma:
+                            msg = [{"role": "user", "content": f"{corrected_state['system']}\n\n{corrected_state['reasoning_prompt']}"}]
+                        else:
+                            msg = [
+                                {"role": "system", "content": corrected_state["system"]},
+                                {"role": "user", "content": corrected_state["reasoning_prompt"]}
+                            ]
+                        
+                        try:
+                            out = agent.llm.chat(messages=[msg], sampling_params=agent.sampling_params)
+                            if out and out[0].outputs:
+                                corrected_reasoning = out[0].outputs[0].text.strip()
+                                corrected_reasoning = strip_think_blocks(corrected_reasoning)
+                                corrected_reasoning = strip_hallucinated_turns(corrected_reasoning)
+                                
+                                new_resp = agent.finish_round(corrected_state, corrected_reasoning)
+                                
+                                if _TTS is not None and isinstance(agent, _TTS):
+                                    speak_msg = agent.build_speak_messages(corrected_state)
+                                    speak_out = agent.llm.chat(messages=[speak_msg], sampling_params=agent._speak_params)
+                                    if speak_out and speak_out[0].outputs:
+                                        public_msg = speak_out[0].outputs[0].text.strip()
+                                        new_resp = agent.attach_public_message(new_resp, public_msg)
+
+                                logger.info("  --- CORRECTED ---\n%s\n--- END CORRECTED ---", new_resp.reasoning)
+                                round_entry.agent_responses[agent_id] = new_resp
+                                flag_record["corrected_answer"] = new_resp.answer
+                        except Exception as e:
+                            logger.error("Error during agent correction for %s: %s", agent_id, e)
 
         return round_entry
 
@@ -407,7 +530,7 @@ class DebateArena:
         return "unresolved"
 
     def _update_memories(
-        self, conversation: Conversation, result: Any
+        self, conversation: Conversation, result: Any, question_data: Dict[str, Any]
     ) -> None:
         """
         Update memories for all agents that have them.
@@ -415,10 +538,11 @@ class DebateArena:
         Args:
             conversation: The full conversation.
             result: The debate result (final answer).
+            question_data: The MMLU question data (for domain stats).
         """
         for agent in self.agents:
             if hasattr(agent, "update_memory"):
-                agent.update_memory(conversation, result)
+                agent.update_memory(conversation, result=result, question_data=question_data)
 
     # ------------------------------------------------------------------
     # Utility

@@ -118,22 +118,58 @@ class BaseAgent():
         Returns:
             A single answer letter string, or "?" if not found.
         """
-        # Match {{X}} pattern (strongest signal)
-        matches = re.findall(r"\{\{([A-Z])\}\}", raw_response)
-        if matches:
-            return matches[-1]
+        # We only want to strip common sentence-ending punctuation/whitespace
+        # We avoid string.punctuation so we don't strip bracketed answers like {{A}}
+        strip_chars = " \t\n\r" + ".,!?;:'\"*"
+        clean_end = raw_response.rstrip(strip_chars)
+        
+        # 1. First prioritize {{X}} if it's explicitly at the end
+        match_end = re.search(r"\{\{([A-Z])\}\}$", clean_end)
+        if match_end:
+            return match_end.group(1)
+            
+        # 2. Check if there's a standalone answer X at the end
+        match_end = re.search(r"(?:^|[^a-zA-Z0-9])([A-Z])$", clean_end)
+        if match_end:
+            return match_end.group(1)
+            
+        # 3. Check for \boxed{X} at the end
+        match_end = re.search(r"\\boxed\{([A-J])\}$", clean_end)
+        if match_end:
+            return match_end.group(1)
+            
+        # 4. Check for standalone digit at the end
+        match_end = re.search(r"(?:^|[^a-zA-Z0-9])([0-9])$", clean_end)
+        if match_end:
+            return chr(65 + int(match_end.group(1)))
 
-        # Fallback: "The answer is X" or "(X)"
-        matches = re.findall(r"[Tt]he answer is\s*\(?([A-Z])\)?", raw_response)
+        # ---------------------------------------------------------------------
+        # Fallbacks: if the answer wasn't correctly positioned at the very end
+        # we scan the whole text and pick the *last* explicit answer pattern.
+        # ---------------------------------------------------------------------
+        matches = []
+        
+        for m in re.finditer(r"\{\{([A-Z])\}\}", raw_response):
+            matches.append((m.end(), m.group(1)))
+            
+        for m in re.finditer(r"\\boxed\{([A-J])\}", raw_response):
+            matches.append((m.end(), m.group(1)))
+            
+        for m in re.finditer(r"(?:[Ff]inal|[Tt]he) answer is\s*\(?([A-Z])\)?", raw_response):
+            matches.append((m.end(), m.group(1)))
+            
+        for m in re.finditer(r"(?:^|\n)([A-Z])(?:[.)\s]|$)(?!\w)", raw_response):
+            matches.append((m.end(), m.group(1)))
+            
+        for m in re.finditer(r"(?:answer|option|choice)[:\s]+([0-9])\b", raw_response, re.IGNORECASE):
+            matches.append((m.end(), chr(65 + int(m.group(1)))))
+            
+        for m in re.finditer(r"(?:^|\n)([0-9])(?:[.)\s]|$)", raw_response):
+            matches.append((m.end(), chr(65 + int(m.group(1)))))
+            
         if matches:
-            return matches[-1]
-
-        # Match a standalone single letter on its own line, or "X." / "X)" at start
-        # Only match if the letter is followed by end-of-string, '.', ')', or whitespace
-        # AND is not followed by more word characters (to avoid "I believe...")
-        match = re.match(r"^([A-Z])(?:[.)\s]|$)(?!\w)", raw_response.strip())
-        if match:
-            return match.group(1)
+            matches.sort(key=lambda x: x[0])
+            return matches[-1][1]
 
         return "?"
 

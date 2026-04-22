@@ -5,17 +5,17 @@ Stage 1 (Private):  Full-depth chain-of-thought reasoning with no word limit.
                     This reasoning is stored in AgentResponse.reasoning but is
                     NOT shared with other agents.
 
-Stage 2 (Public):   A concise ≤200-word debate message distilled from the
+Stage 2 (Public):   A concise ≤300-word debate message distilled from the
                     private reasoning, explicitly addressing peers' arguments.
                     This is stored in AgentResponse.public_message and is the
                     ONLY text peers see in subsequent rounds.
 
-Prompt growth is bounded at O(agents × rounds × 200 words) regardless of how
+Prompt growth is bounded at O(agents × rounds × 300 words) regardless of how
 deeply the agent reasons privately.
 """
 
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from vllm import LLM, SamplingParams
 
@@ -26,9 +26,9 @@ from utils import strip_hallucinated_turns, strip_think_blocks
 
 logger = logging.getLogger(__name__)
 
-# Hard token cap for the public message generation to enforce the 200-word
+# Hard token cap for the public message generation to enforce the 300-word
 # limit at the generation level, not just via prompt instruction.
-_SPEAK_MAX_TOKENS = 320  # ~200 words + answer tag headroom
+_SPEAK_MAX_TOKENS = 480  # ~300 words + answer tag headroom
 
 
 class ThinkThenSpeakDebater(BaseAgent):
@@ -37,7 +37,7 @@ class ThinkThenSpeakDebater(BaseAgent):
 
     In each round the agent:
       1. Reasons privately (full chain-of-thought, private reasoning prompt).
-      2. Distills that reasoning into a ≤200-word public message addressing
+      2. Distills that reasoning into a ≤300-word public message addressing
          its peers, which is what peers see in subsequent rounds.
 
     The DebateArena orchestrates both stages via:
@@ -54,18 +54,29 @@ class ThinkThenSpeakDebater(BaseAgent):
     SOLO_SYSTEM_PROMPT = (
         "You are a knowledgeable assistant answering a multiple-choice question. "
         "Reason step by step through the question, then provide your final answer as {{X}} "
-        "where X is the answer letter."
+        "where X is a single capital letter (e.g., A, B, C, ..., J). "
+        "NEVER use a number — always use the letter label shown in the options."
     )
 
     THINK_SYSTEM_PROMPT = (
         "You are a critical thinker in a multi-agent debate. "
         "Reason privately and thoroughly about the question. "
-        "Consider your peers' arguments carefully — do they reveal flaws in your reasoning? "
-        "End with your final answer as {{X}} where X is the answer letter."
+        "Carefully evaluate your peers' arguments: do they introduce new evidence, "
+        "stronger reasoning, or a perspective you had not considered? "
+        "Update your position when you find genuine reason to — but hold your ground "
+        "when peers are simply asserting without new substance. "
+        "End with your final answer as {{X}} where X is a single capital letter (A–J). "
+        "NEVER output a number — always use the letter label shown in the options."
     )
 
     SPEAK_SYSTEM_PROMPT = (
-        "You are a debate participant. Write a concise, persuasive message for your peers."
+        "You are a rigorous debate participant. "
+        "Back every claim with a specific reason or piece of evidence — do not simply assert your answer. "
+        "When you disagree with a peer, name the specific flaw in their argument or the evidence they are missing. "
+        "If a peer has challenged your position, address their objection directly — "
+        "whether you are updating your view or standing by it, explain your reasoning clearly. "
+        "Do not gloss over disagreements with vague consensus — resolve them with substance. "
+        "Be concise and persuasive."
     )
 
     def __init__(
@@ -90,7 +101,7 @@ class ThinkThenSpeakDebater(BaseAgent):
         self.name = name
 
         # Sampling params for Stage 2 (speak). Use a tighter max_tokens to
-        # enforce the 200-word budget at the generation level.
+        # enforce the 300-word budget at the generation level.
         self._speak_params = SamplingParams(
             temperature=self.sampling_params.temperature,
             max_tokens=_SPEAK_MAX_TOKENS,
@@ -102,32 +113,29 @@ class ThinkThenSpeakDebater(BaseAgent):
 
     def build_public_history(self, history: Conversation) -> str:
         """
-        Build a compact peer context from the *public messages* only.
-
-        Only the most recent round's public messages are included — the agent
-        already received older rounds in its previous reasoning prompt, so there
-        is no information loss, only prompt savings.
+        Build a peer context from the *public messages* of all previous rounds.
 
         Args:
             history: Full conversation history (all previous rounds).
 
         Returns:
-            A formatted string of last-round public messages.
+            A formatted string of all public messages across the debate.
         """
         if not history:
             return ""
 
-        last_round = history[-1]
         lines: List[str] = []
-        for agent_id, response in last_round.agent_responses.items():
-            if response.name == self.name:
-                speaker = f"You ({response.name})"
-                # Use own public message if available, else fall back to answer only
-                msg = response.public_message if response.public_message else f"Answer: {response.answer}"
-            else:
-                speaker = f"Peer ({response.name})"
-                msg = response.public_message if response.public_message else f"Answer: {response.answer}"
-            lines.append(f"{speaker}: {msg}")
+        for i, past_round in enumerate(history):
+            lines.append(f"--- Round {i} ---")
+            for agent_id, response in past_round.agent_responses.items():
+                if response.name == self.name:
+                    speaker = f"You ({response.name})"
+                    # Use own public message if available, else fall back to answer only
+                    msg = response.public_message if response.public_message else f"Answer: {response.answer}"
+                else:
+                    speaker = f"Peer ({response.name})"
+                    msg = response.public_message if response.public_message else f"Answer: {response.answer}"
+                lines.append(f"{speaker}: {msg}")
 
         return "\n\n".join(lines)
 
@@ -164,11 +172,23 @@ class ThinkThenSpeakDebater(BaseAgent):
         is_solo = not history
         next_round = len(history)
 
+        # Extract peer names and last round messages from the conversation history
+        peer_names: List[str] = []
+        recent_peer_messages: List[str] = []
+        if history:
+            for _, response in history[-1].agent_responses.items():
+                if response.name != self.name:
+                    peer_names.append(response.name)
+                    msg = response.public_message if response.public_message else f"Answer: {response.answer}"
+                    recent_peer_messages.append(f"Peer ({response.name}): {msg}")
+
         if is_solo:
             system = self.SOLO_SYSTEM_PROMPT
             instruction = (
                 "Reason step by step through the question, "
-                "then provide your final answer as {{X}}."
+                "then provide your final answer as {{X}} where X is the capital LETTER "
+                "of your chosen option (e.g., A, B, C, ..., J). "
+                "Do NOT write a number — use the letter label shown in the options."
             )
             reasoning_prompt = f"{question_prompt}\n\n{instruction}"
             logger.debug("[TTS Round 0 SOLO] %s", self.agent_id)
@@ -176,7 +196,16 @@ class ThinkThenSpeakDebater(BaseAgent):
             public_history = self.build_public_history(history)
             mem = self.get_memory()
 
+            # Extract own private reasoning from the immediate previous round
+            own_past_reasoning = ""
+            for _, response in history[-1].agent_responses.items():
+                if response.name == self.name:
+                    own_past_reasoning = response.reasoning
+                    break
+
             parts = [question_prompt]
+            if own_past_reasoning:
+                parts.append(f"[Your Private Thoughts from Round {next_round-1}]\n{own_past_reasoning}")
             if mem:
                 parts.append(mem)
             parts.append(public_history)
@@ -185,7 +214,9 @@ class ThinkThenSpeakDebater(BaseAgent):
             base_instruction = (
                 "Based on the debate messages above, reason privately about whether to "
                 "update your position. Consider each peer's arguments carefully. "
-                "End with your final answer as {{X}}."
+                "End with your final answer as {{X}} where X is the capital LETTER "
+                "of your chosen option (e.g., A, B, C, ..., J). "
+                "Do NOT write a number — use the letter label shown in the options."
             )
             instruction = f"{mem_instruction}\n{base_instruction}" if mem_instruction else base_instruction
             reasoning_prompt = "\n\n".join(parts) + f"\n\n{instruction}"
@@ -197,7 +228,25 @@ class ThinkThenSpeakDebater(BaseAgent):
             "system": system,
             "is_solo": is_solo,
             "next_round": next_round,
+            "peer_names": peer_names,
+            "recent_peer_messages": "\n\n".join(recent_peer_messages),
         }
+
+    def prepare_corrected_round(self, state: dict, observer_notice: str) -> dict:
+        """
+        Re-build the reasoning prompt with an Observer notice appended.
+        Returns a new state dict for re-generation.
+        """
+        corrected_prompt = (
+            state["reasoning_prompt"]
+            + f"\n\n[Observer Notice] {observer_notice}\n\n"
+            + "Given this feedback, re-examine your reasoning independently. "
+            + "If you are changing your position, you MUST explain specifically "
+            + "what flaw you found in your previous reasoning. If you are "
+            + "maintaining your position, address the specific peer arguments "
+            + "mentioned above."
+        )
+        return {**state, "reasoning_prompt": corrected_prompt}
 
     def finish_round(self, state: dict, private_reasoning: str) -> AgentResponse:
         """
@@ -264,22 +313,68 @@ class ThinkThenSpeakDebater(BaseAgent):
             public_message: The Stage 2 output text.
 
         Returns:
-            Updated AgentResponse.
+            Updated AgentResponse. The arena uses the hidden ``_public_extracted``
+            attribute to distinguish genuine answer mismatches from fallback injections.
         """
         # Ensure the answer tag is present in the public message
         answer = self.extract_answer(public_message)
-        if answer == "?":
+        public_extracted = answer != "?"
+        if not public_extracted:
             # Fall back to the answer extracted from private reasoning
             answer = response.answer
             public_message = public_message.rstrip() + f"\n\n{{{{answer}}}}"
             public_message = public_message.replace("{answer}", answer)
 
-        return AgentResponse(
+        resp = AgentResponse(
             name=response.name,
             reasoning=response.reasoning,
             answer=answer if answer != "?" else response.answer,
             public_message=public_message,
         )
+        # Side-channel flag used by the arena for inconsistency detection
+        resp._public_extracted = public_extracted  # type: ignore[attr-defined]
+        return resp
+
+    def build_inconsistency_correction_messages(
+        self,
+        private_reasoning: str,
+        private_answer: str,
+        public_answer: str,
+    ) -> list:
+        """
+        Build a Stage 2 correction prompt when the agent's public answer
+        differs from its private reasoning conclusion.
+
+        Args:
+            private_reasoning: The full Stage 1 reasoning text.
+            private_answer: The answer letter extracted from Stage 1.
+            public_answer: The mismatched answer letter from the draft public message.
+
+        Returns:
+            A messages list suitable for ``llm.chat()``.
+        """
+        private_tag = "{{" + private_answer + "}}"
+        public_tag   = "{{" + public_answer  + "}}"
+        correction_prompt = (
+            f"INCONSISTENCY DETECTED: Your private reasoning concluded {private_tag}, "
+            f"but your public message stated {public_tag}. "
+            f"This is internally inconsistent — you must be honest and align your public message "
+            f"with your actual private conclusion.\n\n"
+            f"Rewrite your public message (≤300 words) to faithfully reflect your private "
+            f"reasoning conclusion of {private_tag}. "
+            f"Address your peers' arguments as before, but end with {private_tag}, "
+            f"which is what your reasoning actually supports.\n\n"
+            f"Your private reasoning:\n{private_reasoning}"
+        )
+
+        if "gemma" in self.model_name.lower():
+            return [
+                {"role": "user", "content": f"{self.SPEAK_SYSTEM_PROMPT}\n\n{correction_prompt}"},
+            ]
+        return [
+            {"role": "system", "content": self.SPEAK_SYSTEM_PROMPT},
+            {"role": "user", "content": correction_prompt},
+        ]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -288,7 +383,7 @@ class ThinkThenSpeakDebater(BaseAgent):
     def _build_speak_prompt(self, state: dict, private_reasoning: str) -> str:
         """
         Build the Stage 2 prompt that distills private reasoning into a
-        ≤200-word public message.
+        ≤300-word public message.
 
         Args:
             state: The state dict from ``prepare_round()``.
@@ -301,30 +396,42 @@ class ThinkThenSpeakDebater(BaseAgent):
             # Round 0: no peers to address, just summarise the answer concisely
             return (
                 "You just reasoned about a multiple-choice question. "
-                "Write a concise summary (≤200 words) of your reasoning and conclusion. "
-                "End with your final answer as {{X}}.\n\n"
+                "Write a concise summary (≤300 words) of your reasoning and conclusion. "
+                "End with your final answer as {{X}} where X is the capital LETTER of your chosen option "
+                "(e.g., A, B, C, ..., J). Do NOT write a number.\n\n"
                 f"Your reasoning:\n{private_reasoning}"
             )
 
+        peer_names = state.get("peer_names", [])
+        peer_list = ", ".join(peer_names) if peer_names else "your peers"
+        recent_msgs = state.get("recent_peer_messages", "")
+        
+        recent_msg_block = ""
+        if recent_msgs:
+            recent_msg_block = f"\n\nMost recent peer messages you should address:\n{recent_msgs}"
+
         return (
             "You just reasoned privately about this debate question. "
-            "Now write a concise message (≤200 words) for your debate peers.\n\n"
+            "Now write a concise message (≤300 words) for your debate peers.\n\n"
+            f"Your debate peers are: {peer_list}.\n"
+            "You MUST ONLY address these peers — do NOT invent or hallucinate other agent names.\n\n"
             "Your message MUST:\n"
-            "1. Address each peer by name — state whether you agree or disagree and why.\n"
+            f"1. Address each peer by their actual name ({peer_list}) — state whether you agree or disagree and why.\n"
             "2. Present your strongest supporting argument clearly.\n"
-            "3. End with your final answer as {{X}} where X is the answer letter.\n\n"
-            "Do not exceed 200 words.\n\n"
-            f"Your private reasoning:\n{private_reasoning}"
+            "3. End with your final answer as {{X}} where X is the capital LETTER of your chosen option "
+            "(e.g., A, B, C, ..., J). Do NOT write a number.\n\n"
+            "Do not exceed 300 words.\n\n"
+            f"Your private reasoning:\n{private_reasoning}{recent_msg_block}"
         )
 
     # ------------------------------------------------------------------
     # Memory update
     # ------------------------------------------------------------------
 
-    def update_memory(self, history: Conversation, result) -> None:
+    def update_memory(self, history: Conversation, result: Any = None, **kwargs) -> None:
         """Update the agent's memory after a debate concludes."""
         if self.memory is not None:
-            self.memory.update_memory(history, result=result)
+            self.memory.update_memory(history, result=result, **kwargs)
 
     # ------------------------------------------------------------------
     # Convenience wrapper (single-agent use / testing)

@@ -2,12 +2,17 @@
 """
 Heterogeneous 2-agent Think-Then-Speak debate evaluation (no persistent memories).
 
-Runs a 2-agent debate using ThinkThenSpeakDebater:
+Identical to the observer_targeted run EXCEPT no Observer agent is used.
+The evaluation set is restricted to the same DCR-failure question IDs derived
+from the baseline no-memories run, enabling a direct apples-to-apples comparison
+between observer vs. no-observer on the same hard questions.
+
+Baseline CSV:
+    evaluation/metrics_log_tts_qwen7B_llama8B_44599920_no_memories.csv
+
+Models:
   Agent_Qwen:  Qwen/Qwen2.5-7B-Instruct         — GPU 0  (~14 GB bf16)
   Agent_Llama: meta-llama/Llama-3.1-8B-Instruct  — GPU 1  (~16 GB bf16)
-
-Each agent reasons privately (full chain-of-thought), then distills its reasoning
-into a ≤200-word public message that peers see in subsequent rounds.
 
 NOTE: Requires 2 GPUs.
 """
@@ -48,6 +53,9 @@ def truncate_slurm_err_log():
             logger.info("Truncated SLURM .err log (%s, was %.1f MB)", err_file, size_mb)
     except OSError as e:
         logger.warning("Could not truncate .err log: %s", e)
+
+
+
 
 
 def main():
@@ -93,7 +101,7 @@ def main():
 
     # Stage 1 (private reasoning): generous token budget for deep CoT.
     # Stage 2 (public speak): capped inside ThinkThenSpeakDebater._speak_params.
-    sampling_params = SamplingParams(temperature=0.3, max_tokens=2048)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
 
     arena = DebateArena(
         agent_classes=[ThinkThenSpeakDebater, ThinkThenSpeakDebater],
@@ -124,7 +132,8 @@ def main():
 
     csv_headers.extend([
         "system_accuracy", "resolved_accuracy",
-        "dcr", "nar", "dcr_nar_pool_size"
+        "dcr", "nar", "dcr_nar_pool_size",
+        "total_inconsistency_flags"
     ])
 
     with open(csv_file, "w", newline="") as f:
@@ -171,6 +180,7 @@ def main():
             summary["dcr"],
             summary["nar"],
             summary["dcr_nar_pool_size"],
+            result.get("total_inconsistency_flags", 0),
         ])
 
         with open(csv_file, "a", newline="") as f:
