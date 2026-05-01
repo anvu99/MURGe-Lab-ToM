@@ -78,7 +78,7 @@ def load_mmlu_pro(split: str = "test", num_samples: int = 1, category: Optional[
             questions_data = filtered_data
             print(f"Filtered to {len(questions_data)} questions in categories {categories}")
     
-    if num_samples < len(questions_data):
+    if num_samples is not None and num_samples < len(questions_data):
         # 1. Group by category
         by_cat = defaultdict(list)
         for q in questions_data:

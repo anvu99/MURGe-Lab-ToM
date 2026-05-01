@@ -119,29 +119,35 @@ class ThinkThenSpeakDebater(BaseAgent):
         """
         Build a peer context from the *public messages* of all previous rounds.
 
+        Only turns where a public message was actually produced are included.
+        Solo/private turns (no public_message) are intentionally excluded so
+        that agents cannot infer a peer's private answer before the peer has
+        spoken publicly.
+
         Args:
             history: Full conversation history (all previous rounds).
 
         Returns:
-            A formatted string of all public messages across the debate.
+            A formatted string of all public messages across the debate,
+            or empty string if no public exchange has occurred yet.
         """
         if not history:
             return ""
 
         lines: List[str] = []
         for i, past_round in enumerate(history):
-            lines.append(f"--- Round {i} ---")
+            turn_lines: List[str] = []
             for agent_id, response in past_round.agent_responses.items():
-                if response.name == self.name:
-                    speaker = "You"
-                    # Use own public message if available, else fall back to answer only
-                    msg = response.public_message if response.public_message else f"Answer: {response.answer}"
-                else:
-                    speaker = f"Peer ({response.name})"
-                    msg = response.public_message if response.public_message else f"Answer: {response.answer}"
-                lines.append(f"{speaker}: {msg}")
+                if not response.public_message:
+                    # No public statement in this turn — skip entirely.
+                    continue
+                speaker = "You" if response.name == self.name else f"Peer ({response.name})"
+                turn_lines.append(f"{speaker}: {response.public_message}")
+            if turn_lines:
+                lines.append(f"--- Turn {i} ---")
+                lines.extend(turn_lines)
 
-        return "\n\n".join(lines)
+        return "\n\n".join(lines) if lines else ""
 
     def get_memory(self) -> str:
         """Retrieve memory context, or empty string if no memory is attached."""
@@ -178,12 +184,20 @@ class ThinkThenSpeakDebater(BaseAgent):
         """
         current_round_responses = kwargs.get("current_round_responses", {})
         
-        # If history is empty, it is Round 0. Force independent reasoning.
-        is_solo = not history
+        # An agent's first turn is always "Round 0" (solo mode). Force independent reasoning.
+        has_spoken = any(
+            self.name == response.name
+            for round_entry in history
+            for _, response in round_entry.agent_responses.items()
+        )
+        is_solo = not has_spoken
         if is_solo:
+            history = []
             current_round_responses = {}
-            
-        next_round = len(history)
+
+        next_round = len([
+            r for r in history if any(resp.name == self.name for resp in r.agent_responses.values())
+        ])
 
         # Extract peer names and last round messages from the conversation history
         peer_names: List[str] = []

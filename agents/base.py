@@ -110,14 +110,119 @@ class BaseAgent():
 
     def extract_answer(self, raw_response: str) -> str:
         """
-        Parse the answer letter (e.g., "B") from the LLM's raw output.
+        Parse the answer letter (A-J) from the LLM's raw output.
+
+        Strategy (in order of priority):
+
+        1. Last-token pass — check the very end of the response for any
+           recognised answer format after stripping trailing whitespace.
+           Formats tried (in decreasing specificity):
+             - {{X}}      template-escaped double braces
+             - {X}        single-brace (produced when not inside an f-string)
+             - \\boxed{X}
+             - bare X     lone capital letter not attached to a word
+           This step is strict (tail-only) so it cannot be fooled by letters
+           embedded inside prose like "P = I / (RT)" in a bullet point.
+
+        2. High-priority full-text scan — {{X}}, {X}, \\boxed{X}, and the
+           explicit arrow directives (My private conclusion / My final answer).
+           We pick the LAST occurrence.
+
+        3. Low-priority fallback scan — "answer is X", numbered lists.
+           Only reached when the model failed to follow the format instructions.
 
         Args:
             raw_response: The raw text output from the LLM.
 
         Returns:
-            A single answer letter string, or "?" if not found.
+            A single uppercase answer letter (A-J), or "?" if not found.
         """
+        if not raw_response:
+            return "?"
+
+        # ------------------------------------------------------------------
+        # Step 1: Last-token pass (tail of the text, all recognised formats).
+        # Strip trailing whitespace only — don't eat closing braces.
+        # ------------------------------------------------------------------
+        tail = raw_response.rstrip(" \t\n\r")
+
+        # 1a. {{X}} — template-escaped double braces
+        m = re.search(r"\{\{([A-J])\}\}$", tail)
+        if m:
+            return m.group(1)
+
+        # 1b. {X} — single-brace variant
+        m = re.search(r"\{([A-J])\}$", tail)
+        if m:
+            return m.group(1)
+
+        # 1c. \boxed{X}
+        m = re.search(r"\\boxed\{([A-J])\}$", tail)
+        if m:
+            return m.group(1)
+
+        # 1d. Bare capital letter at the very end, not attached to a word.
+        #     Strip common sentence-ending punctuation (but NOT braces) first.
+        tail_stripped = tail.rstrip(".,!?;:'\"* \t\n\r")
+        m = re.search(r"(?:^|[^A-Za-z0-9])([A-J])$", tail_stripped)
+        if m:
+            return m.group(1)
+
+        # 1e. Digit at the very end — convert to letter (0->A … 9->J)
+        m = re.search(r"(?:^|[^A-Za-z0-9])([0-9])$", tail_stripped)
+        if m:
+            return chr(65 + int(m.group(1)))
+
+        # ------------------------------------------------------------------
+        # Step 2: High-priority full-text scan.
+        # Only explicit structured answer formats — pick the LAST occurrence.
+        # ------------------------------------------------------------------
+        high_priority = []
+
+        for m in re.finditer(r"\{\{([A-J])\}\}", raw_response):
+            high_priority.append((m.end(), m.group(1)))
+
+        for m in re.finditer(r"\{([A-J])\}", raw_response):
+            high_priority.append((m.end(), m.group(1)))
+
+        for m in re.finditer(r"\\boxed\{([A-J])\}", raw_response):
+            high_priority.append((m.end(), m.group(1)))
+
+        # Explicit skeleton directive arrows
+        for m in re.finditer(
+            r"\u2192\s*My\s+(?:private\s+conclusion|final\s+answer)\s*:\s*(?:\{\{?)?([A-J])(?:\}?\})?",
+            raw_response,
+        ):
+            high_priority.append((m.end(), m.group(1)))
+
+        if high_priority:
+            high_priority.sort(key=lambda x: x[0])
+            return high_priority[-1][1]
+
+        # ------------------------------------------------------------------
+        # Step 3: Low-priority fallback scan.
+        # Weak heuristics — only reached when the model ignored all formats.
+        # ------------------------------------------------------------------
+        low_priority = []
+
+        for m in re.finditer(r"(?:[Ff]inal|[Tt]he)\s+answer\s+is\s*\(?([A-J])\)?", raw_response):
+            low_priority.append((m.end(), m.group(1)))
+
+        for m in re.finditer(r"(?:^|\n)([A-J])(?:[.)\s]|$)(?!\w)", raw_response):
+            low_priority.append((m.end(), m.group(1)))
+
+        for m in re.finditer(r"(?:answer|option|choice)[:\s]+([0-9])\b", raw_response, re.IGNORECASE):
+            low_priority.append((m.end(), chr(65 + int(m.group(1)))))
+
+        for m in re.finditer(r"(?:^|\n)([0-9])(?:[.)\s]|$)", raw_response):
+            low_priority.append((m.end(), chr(65 + int(m.group(1)))))
+
+        if low_priority:
+            low_priority.sort(key=lambda x: x[0])
+            return low_priority[-1][1]
+
+        return "?"
+
         # We only want to strip common sentence-ending punctuation/whitespace
         # We avoid string.punctuation so we don't strip bracketed answers like {{A}}
         strip_chars = " \t\n\r" + ".,!?;:'\"*"
@@ -146,30 +251,43 @@ class BaseAgent():
         # ---------------------------------------------------------------------
         # Fallbacks: if the answer wasn't correctly positioned at the very end
         # we scan the whole text and pick the *last* explicit answer pattern.
+        # We use a priority system so that explicit formats like {{X}} cannot
+        # be overridden by weak fallbacks like a numbered list "4." later on.
         # ---------------------------------------------------------------------
-        matches = []
+        high_priority_matches = []
+        low_priority_matches = []
         
+        # High priority: Explicitly requested formats
         for m in re.finditer(r"\{\{([A-Z])\}\}", raw_response):
-            matches.append((m.end(), m.group(1)))
+            high_priority_matches.append((m.end(), m.group(1)))
             
         for m in re.finditer(r"\\boxed\{([A-J])\}", raw_response):
-            matches.append((m.end(), m.group(1)))
+            high_priority_matches.append((m.end(), m.group(1)))
+
+        # High priority: Our explicit skeleton prompt directive
+        for m in re.finditer(r"\u2192 My (?:private conclusion|final answer):\s*(?:\{\{)?([A-Z])(?:\}\})?", raw_response):
+            high_priority_matches.append((m.end(), m.group(1)))
             
+        # Low priority: Weak fallbacks (often hallucinated or part of regular text)
         for m in re.finditer(r"(?:[Ff]inal|[Tt]he) answer is\s*\(?([A-Z])\)?", raw_response):
-            matches.append((m.end(), m.group(1)))
+            low_priority_matches.append((m.end(), m.group(1)))
             
         for m in re.finditer(r"(?:^|\n)([A-Z])(?:[.)\s]|$)(?!\w)", raw_response):
-            matches.append((m.end(), m.group(1)))
+            low_priority_matches.append((m.end(), m.group(1)))
             
         for m in re.finditer(r"(?:answer|option|choice)[:\s]+([0-9])\b", raw_response, re.IGNORECASE):
-            matches.append((m.end(), chr(65 + int(m.group(1)))))
+            low_priority_matches.append((m.end(), chr(65 + int(m.group(1)))))
             
         for m in re.finditer(r"(?:^|\n)([0-9])(?:[.)\s]|$)", raw_response):
-            matches.append((m.end(), chr(65 + int(m.group(1)))))
+            low_priority_matches.append((m.end(), chr(65 + int(m.group(1)))))
             
-        if matches:
-            matches.sort(key=lambda x: x[0])
-            return matches[-1][1]
+        if high_priority_matches:
+            high_priority_matches.sort(key=lambda x: x[0])
+            return high_priority_matches[-1][1]
+            
+        if low_priority_matches:
+            low_priority_matches.sort(key=lambda x: x[0])
+            return low_priority_matches[-1][1]
 
         return "?"
 
